@@ -17,7 +17,7 @@ type Local =
     /// <param name="body">Execution body.</param>
     [<CompilerMessage("'FromContinuations' only intended for runtime implementers.", 444)>]
     static member FromContinuations(body : ExecutionContext -> Continuation<'T> -> unit) : Local<'T> = 
-        mkLocal(fun ctx cont -> if ctx.IsCancellationRequested then cont.Cancel ctx else body ctx cont)
+        mkLocal(ofLambda body)
 
     /// <summary>
     ///     Runs provided workflow in a nested execution context that is
@@ -32,7 +32,7 @@ type Local =
                                         update : ExecutionContext -> ExecutionContext, 
                                         revert : ExecutionContext -> ExecutionContext) : Local<'T> =
 
-        Local.FromContinuations(withNestedContext update revert workflow.Body)
+        mkLocal(withNestedContext update revert workflow.Body)
 
     /// <summary>
     ///     Runs provided workflow in a nested execution context that is
@@ -51,7 +51,7 @@ type Local =
             let tres = ctx.Resources.Resolve<'TResource> ()
             { ctx with Resources = ctx.Resources.Register(f tres) }
 
-        Local.FromContinuations(withNestedContext (updateCtx update) (updateCtx revert) workflow.Body) 
+        mkLocal (withNestedContext (updateCtx update) (updateCtx revert) workflow.Body) 
 
     /// <summary>
     ///     Wraps a workflow with a mapped continuation.
@@ -60,7 +60,7 @@ type Local =
     /// <param name="workflow">Input workflow.</param>
     [<CompilerMessage("'GetResources' only intended for runtime implementers.", 444)>]
     static member WithMappedContinuation (mapper : Continuation<'T> -> Continuation<'S>) (workflow : Local<'S>) : Local<'T> =
-        mkLocal (fun ctx cont -> workflow.Body ctx (mapper cont))
+        Local.FromContinuations (fun ctx cont -> workflow.Body.Apply ctx (mapper cont))
 
     /// <summary>
     ///     Appends a function information entry to the symbolic stacktrace in the exception continuation.
@@ -69,9 +69,9 @@ type Local =
     /// <param name="workflow">Workflow to be wrapped.</param>
     [<CompilerMessage("'GetResources' only intended for runtime implementers.", 444)>]
     static member WithAppendedStackTrace (functionName : string) (workflow : Local<'T>) : Local<'T> =
-        mkLocal (fun ctx cont ->
+        Local.FromContinuations (fun ctx cont ->
             let cont' = { cont with Exception = fun ctx edi -> cont.Exception ctx (appendToStacktrace functionName edi) }
-            workflow.Body ctx cont')
+            workflow.Body.Apply ctx cont')
 
 /// Intrinsic cloud workflow combinators
 type Cloud =
@@ -82,7 +82,7 @@ type Cloud =
     /// <param name="body">Execution body.</param>
     [<CompilerMessage("'FromContinuations' only intended for runtime implementers.", 444)>]
     static member FromContinuations(body : ExecutionContext -> Continuation<'T> -> unit) : Cloud<'T> = 
-        mkCloud(fun ctx cont -> if ctx.IsCancellationRequested then cont.Cancel ctx else body ctx cont)
+        mkCloud(ofLambda body)
 
     /// <summary>
     ///     Runs provided workflow in a nested execution context that is
@@ -97,7 +97,7 @@ type Cloud =
                                         update : ExecutionContext -> ExecutionContext, 
                                         revert : ExecutionContext -> ExecutionContext) : Cloud<'T> =
 
-        Cloud.FromContinuations(withNestedContext update revert workflow.Body) 
+        mkCloud(withNestedContext update revert workflow.Body) 
 
     /// <summary>
     ///     Runs provided workflow in a nested execution context that is
@@ -116,7 +116,7 @@ type Cloud =
             let tres = ctx.Resources.Resolve<'TResource> ()
             { ctx with Resources = ctx.Resources.Register(f tres) }
 
-        Cloud.FromContinuations(withNestedContext (updateCtx update) (updateCtx revert) workflow.Body) 
+        mkCloud(withNestedContext (updateCtx update) (updateCtx revert) workflow.Body) 
 
     /// <summary>
     ///     Wraps a workflow with a mapped continuation.
@@ -125,7 +125,7 @@ type Cloud =
     /// <param name="workflow">Input workflow.</param>
     [<CompilerMessage("'GetResources' only intended for runtime implementers.", 444)>]
     static member WithMappedContinuation (mapper : Continuation<'T> -> Continuation<'S>) (workflow : #Cloud<'S>) : Cloud<'T> =
-        mkCloud (fun ctx cont -> workflow.Body ctx (mapper cont))
+        Cloud.FromContinuations(fun ctx cont -> workflow.Body.Apply ctx (mapper cont))
 
     /// <summary>
     ///     Appends a function information entry to the symbolic stacktrace in the exception continuation.
@@ -134,9 +134,9 @@ type Cloud =
     /// <param name="workflow">Workflow to be wrapped.</param>
     [<CompilerMessage("'GetResources' only intended for runtime implementers.", 444)>]
     static member WithAppendedStackTrace (functionName : string) (workflow : #Cloud<'T>) : Cloud<'T> =
-        mkCloud (fun ctx cont ->
+        Cloud.FromContinuations (fun ctx cont ->
             let cont' = { cont with Exception = fun ctx edi -> cont.Exception ctx (appendToStacktrace functionName edi) }
-            workflow.Body ctx cont')
+            workflow.Body.Apply ctx cont')
 
 
     /// <summary>
@@ -218,7 +218,7 @@ type Cloud =
     /// <param name="context">Local execution context.</param>
     [<CompilerMessage("'StartWithContinuations' only intended for runtime implementers.", 444)>]
     static member StartWithContinuations(workflow : Cloud<'T>, continuation : Continuation<'T>, context : ExecutionContext) : unit =
-        workflow.Body context continuation
+        workflow.Body.Apply context continuation
 
     /// <summary>
     ///     Starts a cloud workflow with given execution context in the current thread.
@@ -230,7 +230,7 @@ type Cloud =
     [<CompilerMessage("'StartWithContinuations' only intended for runtime implementers.", 444)>]
     static member StartWithContinuations(workflow : Cloud<'T>, continuation : Continuation<'T>, 
                                             resources : ResourceRegistry, cancellationToken : ICloudCancellationToken) : unit =
-        workflow.Body { Resources = resources ; CancellationToken = cancellationToken } continuation
+        workflow.Body.Apply { Resources = resources ; CancellationToken = cancellationToken } continuation
 
     /// <summary>
     ///     Starts provided cloud workflow immediately in the current thread.

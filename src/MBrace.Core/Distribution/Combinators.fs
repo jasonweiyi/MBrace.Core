@@ -15,7 +15,7 @@ type Cloud =
     ///     Gets the current cancellation token.
     /// </summary>
     static member CancellationToken : Local<ICloudCancellationToken> = 
-        mkLocal(fun ctx cont -> cont.Success ctx ctx.CancellationToken)
+        Local.FromContinuations(fun ctx cont -> cont.Success ctx ctx.CancellationToken)
 
     /// <summary>
     ///     Raise an exception.

@@ -16,7 +16,8 @@ open MBrace.Core.Internals
 //
 // to avoid capturing local-only state in closures. In other words, this means that
 // cloud workflows form a continuation over reader monad.
-type internal Body<'T> = ExecutionContext -> Continuation<'T> -> unit
+type internal Body<'T> = 
+    abstract Apply : ExecutionContext -> Continuation<'T> -> unit
 
 /// Representation of an MBrace workflow, which, when run 
 /// will produce a value of type 'T, or raise an exception.

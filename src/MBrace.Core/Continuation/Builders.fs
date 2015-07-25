@@ -33,200 +33,253 @@ module internal BuilderImpl =
 
         member inline c.Choice2 (ctx, choice : Choice<#Cloud<'T>, exn>) =
             match choice with
-            | Choice1Of2 wf -> wf.Body ctx c
+            | Choice1Of2 wf -> wf.Body.Apply ctx c
             | Choice2Of2 e -> c.Exception ctx (capture e)
 
         member inline c.Choice3 (ctx, choice : Choice<Body<'T>, exn>) =
             match choice with
-            | Choice1Of2 f -> f ctx c
+            | Choice1Of2 f -> f.Apply ctx c
             | Choice2Of2 e -> c.Exception ctx (capture e)
 
     type ExecutionContext with
         member inline ctx.IsCancellationRequested = ctx.CancellationToken.IsCancellationRequested
 
-    let inline ret t : Body<'T> = fun ctx cont -> if ctx.IsCancellationRequested then cont.Cancel ctx else cont.Success ctx t
-    let inline retFunc (f : unit -> 'T) : Body<'T> = 
-        fun ctx cont ->
-            if ctx.IsCancellationRequested then cont.Cancel ctx else
-            match protect f () with
-            | Choice1Of2 t -> cont.Success ctx t
-            | Choice2Of2 e -> cont.Exception ctx (capture e)
+    type LambdaBody<'T>(f : ExecutionContext -> Continuation<'T> -> unit) =
+        interface Body<'T> with
+            member __.Apply ctx cont = if ctx.IsCancellationRequested then cont.Cancel ctx else f ctx cont
+
+    type Return<'T>(t : 'T) =
+        interface Body<'T> with
+            member __.Apply ctx cont = if ctx.IsCancellationRequested then cont.Cancel ctx else cont.Success ctx t
+
+    type RetFunc<'T>(f : unit -> 'T) =
+        interface Body<'T> with
+            member __.Apply ctx cont =
+                if ctx.IsCancellationRequested then cont.Cancel ctx else
+                match protect f () with
+                | Choice1Of2 t -> cont.Success ctx t
+                | Choice2Of2 e -> cont.Exception ctx (capture e)
+
+    type Raise<'T>(e : exn) =
+        interface Body<'T> with
+            member __.Apply ctx cont =
+                if ctx.IsCancellationRequested then cont.Cancel ctx else cont.Exception ctx (capture e)
+
+
+    type AsyncBody<'T>(asyncWorkflow : Async<'T>) =
+        interface Body<'T> with
+            member __.Apply ctx cont =
+                if ctx.IsCancellationRequested then cont.Cancel ctx else
+                Async.StartWithContinuations(asyncWorkflow, cont.Success ctx, capture >> cont.Exception ctx, cont.Cancellation ctx, ctx.CancellationToken.LocalToken)
+
+    type Delay<'T>(delayed : unit -> Body<'T>) =
+        interface Body<'T> with
+            member __.Apply ctx cont =
+                if ctx.IsCancellationRequested then cont.Cancel ctx else
+                if Trampoline.IsBindThresholdReached() then 
+                    Trampoline.QueueWorkItem (fun () -> cont.Choice3(ctx, protect delayed ()))
+                else
+                    cont.Choice3(ctx, protect delayed ())
+
+    type DelayCloud<'T, 'Cloud when 'Cloud :> Cloud<'T>>(delayed : unit -> 'Cloud) =
+        interface Body<'T> with
+            member __.Apply ctx cont =
+                if ctx.IsCancellationRequested then cont.Cancel ctx else
+                if Trampoline.IsBindThresholdReached() then 
+                    Trampoline.QueueWorkItem (fun () -> cont.Choice2(ctx, protect delayed ()))
+                else
+                    cont.Choice2(ctx, protect delayed ())
+
+    type Bind<'T, 'S>(f : Body<'T>, g : 'T -> Body<'S>) =
+        interface Body<'S> with
+            member __.Apply ctx cont =
+                if ctx.IsCancellationRequested then cont.Cancel ctx else
+                let cont' = {
+                    Success = 
+                        fun ctx t ->
+                            if ctx.IsCancellationRequested then cont.Cancel ctx
+                            elif Trampoline.IsBindThresholdReached() then
+                                Trampoline.QueueWorkItem(fun () -> cont.Choice3(ctx, protect g t))
+                            else
+                                cont.Choice3(ctx, protect g t)
+
+                    Exception = 
+                        fun ctx e -> 
+                            if ctx.IsCancellationRequested then cont.Cancel ctx
+                            elif Trampoline.IsBindThresholdReached() then
+                                Trampoline.QueueWorkItem(fun () -> cont.Exception ctx e)
+                            else
+                                cont.Exception ctx e
+
+                    Cancellation = cont.Cancellation
+                }
+
+                if Trampoline.IsBindThresholdReached() then 
+                    Trampoline.QueueWorkItem (fun () -> f.Apply ctx cont')
+                else
+                    f.Apply ctx cont'
+
+    type BindCloud<'T, 'S, 'SCloud when 'SCloud :> Cloud<'S>>(f : Body<'T>, g : 'T -> 'SCloud) =
+        interface Body<'S> with
+            member __.Apply ctx cont =
+                if ctx.IsCancellationRequested then cont.Cancel ctx else
+                let cont' = {
+                    Success = 
+                        fun ctx t ->
+                            if ctx.IsCancellationRequested then cont.Cancel ctx
+                            elif Trampoline.IsBindThresholdReached() then
+                                Trampoline.QueueWorkItem(fun () -> cont.Choice2(ctx, protect g t))
+                            else
+                                cont.Choice2(ctx, protect g t)
+
+                    Exception = 
+                        fun ctx e -> 
+                            if ctx.IsCancellationRequested then cont.Cancel ctx
+                            elif Trampoline.IsBindThresholdReached() then
+                                Trampoline.QueueWorkItem(fun () -> cont.Exception ctx e)
+                            else
+                                cont.Exception ctx e
+
+                    Cancellation = cont.Cancellation
+                }
+
+                if Trampoline.IsBindThresholdReached() then 
+                    Trampoline.QueueWorkItem (fun () -> f.Apply ctx cont')
+                else
+                    f.Apply ctx cont'
+
+    type Combine<'T, 'S>(f : Body<'T>, g : Body<'S>) =
+        interface Body<'S> with
+            member __.Apply ctx cont =
+                if ctx.IsCancellationRequested then cont.Cancel ctx else
+                let cont' = {
+                    Success = 
+                        fun ctx _ ->
+                            if ctx.IsCancellationRequested then cont.Cancel ctx
+                            elif Trampoline.IsBindThresholdReached() then
+                                Trampoline.QueueWorkItem(fun () -> g.Apply ctx cont)
+                            else
+                                g.Apply ctx cont
+
+                    Exception = 
+                        fun ctx e -> 
+                            if ctx.IsCancellationRequested then cont.Cancel ctx
+                            elif Trampoline.IsBindThresholdReached() then
+                                Trampoline.QueueWorkItem(fun () -> cont.Exception ctx e)
+                            else
+                                cont.Exception ctx e
+
+                    Cancellation = cont.Cancellation
+                }
+
+                if Trampoline.IsBindThresholdReached() then 
+                    Trampoline.QueueWorkItem (fun () -> f.Apply ctx cont')
+                else
+                    f.Apply ctx cont'
+
+    type TryWith<'T, 'TCloud when 'TCloud :> Cloud<'T>>(f : Body<'T>, handler : exn -> 'TCloud) =
+        interface Body<'T> with
+            member __.Apply ctx cont =
+                if ctx.IsCancellationRequested then cont.Cancel ctx else
+                let cont' = {
+                    Success = 
+                        fun ctx t -> 
+                            if ctx.IsCancellationRequested then cont.Cancel ctx
+                            elif Trampoline.IsBindThresholdReached() then
+                                Trampoline.QueueWorkItem(fun () -> cont.Success ctx t)
+                            else
+                                cont.Success ctx t
+                
+                    Exception =
+                        fun ctx edi ->
+                            if ctx.IsCancellationRequested then cont.Cancel ctx
+                            elif Trampoline.IsBindThresholdReached() then
+                                Trampoline.QueueWorkItem(fun () -> cont.Choice2(ctx, protect handler (extract edi)))
+                            else
+                                cont.Choice2(ctx, protect handler (extract edi))
+
+                    Cancellation = cont.Cancellation
+                }
+
+                if Trampoline.IsBindThresholdReached() then 
+                    Trampoline.QueueWorkItem (fun () -> f.Apply ctx cont')
+                else
+                    f.Apply ctx cont'
+
+    type TryFinally<'T>(body : Body<'T>, finalizer : Body<unit>) =
+        interface Body<'T> with
+            member __.Apply ctx cont =
+                if ctx.IsCancellationRequested then cont.Cancel ctx else
+
+                let cont' = {
+                    Success =
+                        fun ctx t -> 
+                            if ctx.IsCancellationRequested then cont.Cancel ctx else
+                            let cont' = Continuation.map (fun () -> t) cont
+                            if Trampoline.IsBindThresholdReached() then
+                                Trampoline.QueueWorkItem(fun () -> finalizer.Apply ctx cont')
+                            else
+                                finalizer.Apply ctx cont'
+
+                    Exception = 
+                        fun ctx edi -> 
+                            if ctx.IsCancellationRequested then cont.Cancel ctx else
+                            let cont' = Continuation.failwith (fun () -> (extract edi)) cont
+                            if Trampoline.IsBindThresholdReached() then
+                                Trampoline.QueueWorkItem(fun () -> finalizer.Apply ctx cont')
+                            else
+                                finalizer.Apply ctx cont'
+
+                    Cancellation = cont.Cancellation
+                }
+
+                if Trampoline.IsBindThresholdReached() then 
+                    Trampoline.QueueWorkItem (fun () -> body.Apply ctx cont')
+                else
+                    body.Apply ctx cont'
+
+    // wraps workflow in a nested execution context which can be updated
+    // once computation is completed.
+    type ContextWrapper<'T>(update : ExecutionContext -> ExecutionContext, revert : ExecutionContext -> ExecutionContext, body : Body<'T>) =
+        interface Body<'T> with
+            member __.Apply ctx cont =
+                if ctx.IsCancellationRequested then cont.Cancel ctx else
+
+                match protect update ctx with
+                | Choice1Of2 ctx' -> 
+                    // update immediate continuation so that execution context is reverted as soon as provided workflow is completed.
+                    let cont' =
+                        { 
+                            Success = fun ctx t -> match protect revert ctx with Choice1Of2 ctx' -> cont.Success ctx' t | Choice2Of2 e -> cont.Exception ctx (capture e)
+                            Exception = fun ctx e -> match protect revert ctx with Choice1Of2 ctx' -> cont.Exception ctx' e | Choice2Of2 e -> cont.Exception ctx (capture e)
+                            Cancellation = fun ctx c -> match protect revert ctx with Choice1Of2 ctx' -> cont.Cancellation ctx' c | Choice2Of2 _ -> cont.Cancellation ctx c
+                        }
+
+                    body.Apply ctx' cont'
+                | Choice2Of2 e -> cont.Exception ctx (capture e)
+
+
+    let inline ret (t : 'T) = new Return<'T>(t) :> Body<'T>
+    let inline retFunc (f : unit -> 'T) = new RetFunc<'T>(f) :> Body<'T>
+    let inline ofLambda (f : ExecutionContext -> Continuation<'T> -> unit) = new LambdaBody<'T>(f) :> Body<'T>
+    let inline raiseM e : Body<'T> = new Raise<'T>(e) :> Body<'T>
+    let inline ofAsync (workflow : Async<'T>) = new AsyncBody<'T>(workflow) :> Body<'T>
+    let inline delay (f : unit -> #Cloud<'T>) = new DelayCloud<'T,_>(f) :> Body<'T>
+    let inline delay' (f : unit -> Body<'T>) = new Delay<'T>(f) :> Body<'T>
+    let inline bind (f : Body<'T>) (cont : 'T -> #Cloud<'S>) = new BindCloud<'T, 'S, _>(f, cont) :> Body<'S>
+    let inline bind' (f : Body<'T>) (cont : 'T -> Body<'S>) = new Bind<'T, 'S>(f , cont) :> Body<'S>
+    let inline combine (f : Body<'T>) (g : Body<'S>) = new Combine<'T, 'S>(f, g) :> Body<'S>
+    let inline tryWith (f : Body<'T>) (cont : exn -> #Cloud<'T>) = new TryWith<'T, _>(f, cont) :> Body<'T>
+    let inline tryFinally (f : Body<'T>) (finalizer : Body<unit>) = new TryFinally<'T>(f, finalizer) :> Body<'T>
+    let inline dispose (d : ICloudDisposable) = ofAsync (async { return! d.Dispose() })
+    let inline withNestedContext (update : ExecutionContext -> ExecutionContext)
+                                  (revert : ExecutionContext -> ExecutionContext) 
+                                  (body : Body<'T>) : Body<'T> = new ContextWrapper<'T>(update, revert, body) :> Body<'T>
 
     let zero : Body<unit> = ret ()
 
-    let inline raiseM e : Body<'T> = fun ctx cont -> if ctx.IsCancellationRequested then cont.Cancel ctx else cont.Exception ctx (capture e)
-    let inline ofAsync (asyncWorkflow : Async<'T>) : Body<'T> = 
-        fun ctx cont ->
-            if ctx.IsCancellationRequested then cont.Cancel ctx else
-            Async.StartWithContinuations(asyncWorkflow, cont.Success ctx, capture >> cont.Exception ctx, cont.Cancellation ctx, ctx.CancellationToken.LocalToken)
-
-    let inline delay (f : unit -> #Cloud<'T>) (ctx : ExecutionContext) (cont : Continuation<'T>) =
-        if ctx.IsCancellationRequested then cont.Cancel ctx else
-        if Trampoline.IsBindThresholdReached() then 
-            Trampoline.QueueWorkItem (fun () -> cont.Choice2(ctx, protect f ()))
-        else
-            cont.Choice2(ctx, protect f ())
-    
-    let inline delay' (f : unit -> Body<'T>) (ctx : ExecutionContext) (cont : Continuation<'T>) =
-        if ctx.IsCancellationRequested then cont.Cancel ctx else
-        if Trampoline.IsBindThresholdReached() then 
-            Trampoline.QueueWorkItem (fun () -> cont.Choice3(ctx, protect f ()))
-        else
-            cont.Choice3(ctx, protect f ())
-
-    type ExplicitDelayWrapper<'T, 'S when 'S :> Cloud<'T>>(f : unit -> 'S) =
-        inherit FSharpFunc<ExecutionContext, Continuation<'T> -> unit> ()
-        override __.Invoke(ctx : ExecutionContext) = fun c -> delay f ctx c
-        member x.Func = x :> obj :?> Body<'T>
-
-    let inline bind (f : Body<'T>) (g : 'T -> #Cloud<'S>) : Body<'S> =
-        fun ctx cont ->
-            if ctx.IsCancellationRequested then cont.Cancel ctx else
-            let cont' = {
-                Success = 
-                    fun ctx t ->
-                        if ctx.IsCancellationRequested then cont.Cancel ctx
-                        elif Trampoline.IsBindThresholdReached() then
-                            Trampoline.QueueWorkItem(fun () -> cont.Choice2(ctx, protect g t))
-                        else
-                            cont.Choice2(ctx, protect g t)
-
-                Exception = 
-                    fun ctx e -> 
-                        if ctx.IsCancellationRequested then cont.Cancel ctx
-                        elif Trampoline.IsBindThresholdReached() then
-                            Trampoline.QueueWorkItem(fun () -> cont.Exception ctx e)
-                        else
-                            cont.Exception ctx e
-
-                Cancellation = cont.Cancellation
-            }
-
-            if Trampoline.IsBindThresholdReached() then 
-                Trampoline.QueueWorkItem (fun () -> f ctx cont')
-            else
-                f ctx cont'
-
-    let inline bind' (f : Body<'T>) (g : 'T -> Body<'S>) : Body<'S> =
-        fun ctx cont ->
-            if ctx.IsCancellationRequested then cont.Cancel ctx else
-            let cont' = {
-                Success = 
-                    fun ctx t ->
-                        if ctx.IsCancellationRequested then cont.Cancel ctx
-                        elif Trampoline.IsBindThresholdReached() then
-                            Trampoline.QueueWorkItem(fun () -> cont.Choice3(ctx, protect g t))
-                        else
-                            cont.Choice3(ctx, protect g t)
-
-                Exception = 
-                    fun ctx e -> 
-                        if ctx.IsCancellationRequested then cont.Cancel ctx
-                        elif Trampoline.IsBindThresholdReached() then
-                            Trampoline.QueueWorkItem(fun () -> cont.Exception ctx e)
-                        else
-                            cont.Exception ctx e
-
-                Cancellation = cont.Cancellation
-            }
-
-            if Trampoline.IsBindThresholdReached() then 
-                Trampoline.QueueWorkItem (fun () -> f ctx cont')
-            else
-                f ctx cont'
-
-    let inline combine (f : Body<'unit>) (g : Body<'T>) : Body<'T> =
-        fun ctx cont ->
-            if ctx.IsCancellationRequested then cont.Cancel ctx else
-            let cont' = {
-                Success = 
-                    fun ctx _ ->
-                        if ctx.IsCancellationRequested then cont.Cancel ctx
-                        elif Trampoline.IsBindThresholdReached() then
-                            Trampoline.QueueWorkItem(fun () -> g ctx cont)
-                        else
-                            g ctx cont
-
-                Exception = 
-                    fun ctx e -> 
-                        if ctx.IsCancellationRequested then cont.Cancel ctx
-                        elif Trampoline.IsBindThresholdReached() then
-                            Trampoline.QueueWorkItem(fun () -> cont.Exception ctx e)
-                        else
-                            cont.Exception ctx e
-
-                Cancellation = cont.Cancellation
-            }
-
-            if Trampoline.IsBindThresholdReached() then 
-                Trampoline.QueueWorkItem (fun () -> f ctx cont')
-            else
-                f ctx cont'
-
-    let inline tryWith (wf : Body<'T>) (handler : exn -> #Cloud<'T>) : Body<'T> =
-        fun ctx cont ->
-            if ctx.IsCancellationRequested then cont.Cancel ctx else
-            let cont' = {
-                Success = 
-                    fun ctx t -> 
-                        if ctx.IsCancellationRequested then cont.Cancel ctx
-                        elif Trampoline.IsBindThresholdReached() then
-                            Trampoline.QueueWorkItem(fun () -> cont.Success ctx t)
-                        else
-                            cont.Success ctx t
-                
-                Exception =
-                    fun ctx edi ->
-                        if ctx.IsCancellationRequested then cont.Cancel ctx
-                        elif Trampoline.IsBindThresholdReached() then
-                            Trampoline.QueueWorkItem(fun () -> cont.Choice2(ctx, protect handler (extract edi)))
-                        else
-                            cont.Choice2(ctx, protect handler (extract edi))
-
-                Cancellation = cont.Cancellation
-            }
-
-            if Trampoline.IsBindThresholdReached() then 
-                Trampoline.QueueWorkItem (fun () -> wf ctx cont')
-            else
-                wf ctx cont'
-
-
-    let inline tryFinally (f : Body<'T>) (finalizer : Body<unit>) : Body<'T> =
-        fun ctx cont ->
-            if ctx.IsCancellationRequested then cont.Cancel ctx else
-
-            let cont' = {
-                Success =
-                    fun ctx t -> 
-                        if ctx.IsCancellationRequested then cont.Cancel ctx else
-                        let cont' = Continuation.map (fun () -> t) cont
-                        if Trampoline.IsBindThresholdReached() then
-                            Trampoline.QueueWorkItem(fun () -> finalizer ctx cont')
-                        else
-                            finalizer ctx cont'
-
-                Exception = 
-                    fun ctx edi -> 
-                        if ctx.IsCancellationRequested then cont.Cancel ctx else
-                        let cont' = Continuation.failwith (fun () -> (extract edi)) cont
-                        if Trampoline.IsBindThresholdReached() then
-                            Trampoline.QueueWorkItem(fun () -> finalizer ctx cont')
-                        else
-                            finalizer ctx cont'
-
-                Cancellation = cont.Cancellation
-            }
-
-            if Trampoline.IsBindThresholdReached() then 
-                Trampoline.QueueWorkItem (fun () -> f ctx cont')
-            else
-                f ctx cont'
-
-    let inline dispose (d : ICloudDisposable) = ofAsync (async { return! d.Dispose() })
-
     let inline usingIDisposable (t : #IDisposable) (g : #IDisposable -> #Cloud<'S>) : Body<'S> =
-        tryFinally (bind ((ret t)) g) (retFunc t.Dispose)
+        tryFinally (bind (ret t) g) (retFunc t.Dispose)
 
     let inline usingICloudDisposable (t : #ICloudDisposable) (g : #ICloudDisposable -> #Cloud<'S>) : Body<'S> =
         tryFinally (bind (ret t) g) (dispose t)
@@ -275,25 +328,6 @@ module internal BuilderImpl =
 
         delay' loop
 
-    // wraps workflow in a nested execution context which can be updated
-    // once computation is completed.
-    let inline withNestedContext (update : ExecutionContext -> ExecutionContext)
-                                  (revert : ExecutionContext -> ExecutionContext) 
-                                  (body : Body<'T>) : Body<'T> =
-        fun ctx cont ->
-            match protect update ctx with
-            | Choice1Of2 ctx' -> 
-                // update immediate continuation so that execution context is reverted as soon as provided workflow is completed.
-                let cont' =
-                    { 
-                        Success = fun ctx t -> match protect revert ctx with Choice1Of2 ctx' -> cont.Success ctx' t | Choice2Of2 e -> cont.Exception ctx (capture e)
-                        Exception = fun ctx e -> match protect revert ctx with Choice1Of2 ctx' -> cont.Exception ctx' e | Choice2Of2 e -> cont.Exception ctx (capture e)
-                        Cancellation = fun ctx c -> match protect revert ctx with Choice1Of2 ctx' -> cont.Cancellation ctx' c | Choice2Of2 _ -> cont.Cancellation ctx c
-                    }
-
-                body ctx' cont'
-            | Choice2Of2 e -> cont.Exception ctx (capture e)
-
 /// A collection of builder implementations for MBrace workflows
 [<AutoOpen>]
 module Builders =
@@ -303,7 +337,7 @@ module Builders =
         let czero : Cloud<unit> = mkCloud zero
         member __.Return (t : 'T) : Cloud<'T> = mkCloud <| ret t
         member __.Zero () : Cloud<unit> = czero
-        member __.Delay (f : unit -> Cloud<'T>) : Cloud<'T> = mkCloud <| ExplicitDelayWrapper<_,_>(f).Func
+        member __.Delay (f : unit -> Cloud<'T>) : Cloud<'T> = mkCloud <| delay f
         member __.ReturnFrom (c : Cloud<'T>) : Cloud<'T> = c
         member __.ReturnFrom (c : Async<'T>) : Cloud<'T> = mkCloud <| ofAsync c
         member __.Combine(f : Cloud<unit>, g : Cloud<'T>) : Cloud<'T> = mkCloud <| combine f.Body g.Body
@@ -334,7 +368,7 @@ module Builders =
         let lzero : Local<unit> = mkLocal zero
         member __.Return (t : 'T) : Local<'T> = mkLocal <| ret t
         member __.Zero () : Local<unit> = lzero
-        member __.Delay (f : unit -> Local<'T>) : Local<'T> = mkLocal <| ExplicitDelayWrapper<_,_>(f).Func
+        member __.Delay (f : unit -> Local<'T>) : Local<'T> = mkLocal <| delay f
         member __.ReturnFrom (c : Local<'T>) : Local<'T> = c
         member __.ReturnFrom (c : Async<'T>) : Local<'T> = mkLocal (ofAsync c)
         member __.Combine(f : Local<unit>, g : Local<'T>) : Local<'T> = mkLocal <| combine f.Body g.Body
